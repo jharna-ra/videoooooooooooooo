@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>White text remover</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--fg:#e8eaf0;--mut:#8b93a7;--acc:#4f8cff;--line:#2a2f3a;--err:#ff6b6b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+main{max-width:900px;margin:0 auto;padding:20px}
+h1{font-size:22px;margin:0 0 4px}p.sub{color:var(--mut);margin:0 0 18px}
+section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+h2{font-size:15px;margin:0 0 10px}
+.row{display:flex;flex-wrap:wrap;gap:10px}
+label{display:flex;flex-direction:column;font-size:12px;color:var(--mut);flex:1 1 140px;gap:4px}
+input{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px;font:inherit;width:100%}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:9px 14px;font:inherit;cursor:pointer}
+button.sec{background:#2a2f3a}button:disabled{opacity:.5;cursor:not-allowed}
+img{max-width:100%;border-radius:8px;margin-top:10px;display:block}
+progress{width:100%;height:10px;margin-top:10px}
+#status{margin-top:8px;font-size:13px;color:var(--mut)}#status.err{color:var(--err);white-space:pre-wrap}
+a.dl{display:inline-block;margin-top:10px;color:var(--acc)}
+</style>
+</head>
+<body>
+<main>
+<h1>White text remover</h1>
+<p class="sub">Removes only the white text pixels and rebuilds them from neighbouring frames (ProPainter). Processing runs on your GPU backend.</p>
+
+<section>
+  <h2>0. Backend</h2>
+  <div class="row">
+    <label>Backend URL (https)<input id="api" placeholder="https://xxxx.trycloudflare.com"></label>
+    <label>API key (optional)<input id="key" type="password"></label>
+  </div>
+  <p style="margin:10px 0 0"><button id="bSave" class="sec">Save &amp; test connection</button></p>
+</section>
+
+<section>
+  <h2>1. Video</h2>
+  <input id="file" type="file" accept="video/*">
+  <progress id="up" value="0" max="100" hidden></progress>
+</section>
+
+<section>
+  <h2>2. Settings</h2>
+  <div class="row">
+    <label>Box X<input id="x" type="number" value="900"></label>
+    <label>Box Y<input id="y" type="number" value="700"></label>
+    <label>Box width<input id="w" type="number" value="380"></label>
+    <label>Box height<input id="h" type="number" value="300"></label>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <label>Brightness bar (lower = more sensitive)<input id="thr" type="number" value="200" min="80" max="245"></label>
+    <label>Max stroke thickness (px)<input id="thick" type="number" value="9" min="2" max="30"></label>
+    <label>Edge expand (px)<input id="grow" type="number" value="2" min="0" max="8"></label>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <label>Preview at (s)<input id="at" type="number" value="5"></label>
+    <label>Start (s)<input id="start" type="number" value="0"></label>
+    <label>End (s, 0 = end)<input id="end" type="number" value="0"></label>
+  </div>
+</section>
+
+<section>
+  <h2>3. Run</h2>
+  <div class="row" style="gap:8px">
+    <button id="bPrev" class="sec">Preview mask</button>
+    <button id="bTest" class="sec">Test 40 frames</button>
+    <button id="bRun">Render full video</button>
+  </div>
+  <progress id="pg" value="0" max="1" hidden></progress>
+  <div id="status"></div>
+  <img id="i1" alt="" hidden><img id="i2" alt="" hidden><img id="i3" alt="" hidden>
+  <a id="dl" class="dl" hidden>Download cleaned video</a>
+</section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const store = {
+  get: k => { try { return localStorage.getItem(k) || '' } catch { return '' } },
+  set: (k, v) => { try { localStorage.setItem(k, v) } catch {} }
+};
+$('api').value = store.get('api'); $('key').value = store.get('key');
+let vid = null, busy = false;
+
+const base = () => $('api').value.trim().replace(/\/+$/, '');
+const key = () => $('key').value.trim();
+const q = () => 'key=' + encodeURIComponent(key());
+function msg(t, err) { const e = $('status'); e.textContent = t; e.className = err ? 'err' : ''; }
+function lock(on) { busy = on; ['bPrev', 'bTest', 'bRun', 'bSave'].forEach(i => $(i).disabled = on); }
+
+async function api(path, body) {
+  if (!base()) throw new Error('Enter the backend URL first.');
+  const r = await fetch(base() + path, {
+    method: body ? 'POST' : 'GET',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': key() },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!r.ok) throw new Error(r.status + ' ' + (await r.text()).slice(0, 400));
+  return r.json();
+}
+
+const P = () => ({
+  id: vid, x: +$('x').value, y: +$('y').value, w: +$('w').value, h: +$('h').value,
+  thr: +$('thr').value, thick: +$('thick').value, grow: +$('grow').value,
+  at: +$('at').value, start: +$('start').value, end: +$('end').value
+});
+const need = () => { if (!vid) throw new Error('Upload a video first.'); };
+
+async function guard(fn) {
+  if (busy) return;
+  lock(true);
+  try { await fn(); } catch (e) { msg(e.message, true); } finally { lock(false); }
+}
+
+$('bSave').onclick = () => guard(async () => {
+  store.set('api', base()); store.set('key', key());
+  await api('/health'); msg('Connected.');
+});
+
+$('file').onchange = () => guard(() => new Promise((res, rej) => {
+  const f = $('file').files[0]; if (!f) return res();
+  if (!base()) return rej(new Error('Enter the backend URL first.'));
+  const fd = new FormData(); fd.append('file', f);
+  const x = new XMLHttpRequest();
+  x.open('POST', base() + '/upload'); x.setRequestHeader('X-API-Key', key());
+  $('up').hidden = false;
+  x.upload.onprogress = e => { if (e.lengthComputable) $('up').value = 100 * e.loaded / e.total; };
+  x.onload = () => {
+    $('up').hidden = true;
+    if (x.status !== 200) return rej(new Error(x.status + ' ' + x.responseText.slice(0, 300)));
+    const j = JSON.parse(x.responseText); vid = j.id;
+    msg(`Uploaded: ${j.duration.toFixed(1)} s, ${j.fps.toFixed(2)} fps`); res();
+  };
+  x.onerror = () => { $('up').hidden = true; rej(new Error('Upload failed (check backend URL / CORS / https).')); };
+  x.send(fd);
+}));
+
+$('bPrev').onclick = () => guard(async () => {
+  need(); msg('Rendering preview...');
+  const j = await api('/preview', P());
+  $('i1').src = j.frame; $('i2').src = j.crop; $('i1').hidden = $('i2').hidden = false; $('i3').hidden = true;
+  $('dl').hidden = true;
+  msg(`Frame ${j.size[0]}x${j.size[1]}. Mask covers ${j.pct}% of the box. Red must be only the letters.`);
+});
+
+async function job(mode) {
+  need(); $('dl').hidden = true;
+  const { job: id } = await api('/jobs', { ...P(), mode });
+  $('pg').hidden = false;
+  for (;;) {
+    await new Promise(r => setTimeout(r, 2000));
+    const s = await api('/jobs/' + id);
+    if (s.status === 'error') throw new Error(s.error);
+    $('pg').value = s.total ? s.done / s.total : 0;
+    msg(s.status === 'queued' ? 'Waiting for the GPU...' :
+        `${s.done}/${s.total} frames` + (s.eta != null && s.total ? `  ETA ${s.eta.toFixed(1)} min` : ''));
+    if (s.status === 'done') { $('pg').hidden = true; return id; }
+  }
+}
+
+$('bTest').onclick = () => guard(async () => {
+  const id = await job('test');
+  $('i3').src = base() + '/jobs/' + id + '/sample?' + q(); $('i3').hidden = false;
+  msg('Left: original | middle: removed pixels in red | right: result');
+});
+
+$('bRun').onclick = () => guard(async () => {
+  const id = await job('render');
+  const a = $('dl'); a.href = base() + '/jobs/' + id + '/result?' + q(); a.hidden = false;
+  msg('Done.');
+});
+</script>
+</body>
+</html>
